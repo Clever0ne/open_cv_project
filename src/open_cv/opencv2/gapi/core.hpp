@@ -2,26 +2,28 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 //
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 
 
 #ifndef OPENCV_GAPI_CORE_HPP
 #define OPENCV_GAPI_CORE_HPP
 
+#include <math.h>
+
 #include <utility> // std::tuple
 
 #include <opencv2/imgproc.hpp>
 
-#include "opencv2/gapi/gmat.hpp"
-#include "opencv2/gapi/gscalar.hpp"
-#include "opencv2/gapi/gkernel.hpp"
+#include <opencv2/gapi/gmat.hpp>
+#include <opencv2/gapi/gscalar.hpp>
+#include <opencv2/gapi/gkernel.hpp>
 
-/** \defgroup gapi_core G-API core (basic) functionality
+/** \defgroup gapi_core G-API Core functionality
 @{
     @defgroup gapi_math Graph API: Math operations
     @defgroup gapi_pixelwise Graph API: Pixelwise operations
     @defgroup gapi_matrixop Graph API: Operations on matrices
-    @defgroup gapi_transform Graph API: Geometric, depth and LUT-like image transformations
+    @defgroup gapi_transform Graph API: Image and channel composition functions
 @}
  */
 namespace cv { namespace gapi {
@@ -29,7 +31,7 @@ namespace core {
     using GMat2 = std::tuple<GMat,GMat>;
     using GMat3 = std::tuple<GMat,GMat,GMat>; // FIXME: how to avoid this?
     using GMat4 = std::tuple<GMat,GMat,GMat,GMat>;
-    using GMatScalar = std::tuple<GMat, GScalar>;
+    using GMatScalar  = std::tuple<GMat, GScalar>;
 
     G_TYPED_KERNEL(GAdd, <GMat(GMat, GMat, int)>, "org.opencv.core.math.add") {
         static GMatDesc outMeta(GMatDesc a, GMatDesc b, int ddepth) {
@@ -306,6 +308,13 @@ namespace core {
         }
     };
 
+    G_TYPED_KERNEL(GCountNonZero, <GOpaque<int>(GMat)>, "org.opencv.core.matrixop.countNonZero") {
+        static GOpaqueDesc outMeta(GMatDesc in) {
+            GAPI_Assert(in.chan == 1);
+            return empty_gopaque_desc();
+        }
+    };
+
     G_TYPED_KERNEL(GAddW, <GMat(GMat, double, GMat, double, double, int)>, "org.opencv.core.matrixop.addweighted") {
         static GMatDesc outMeta(GMatDesc a, double, GMatDesc b, double, double, int ddepth) {
             if (ddepth == -1)
@@ -390,11 +399,21 @@ namespace core {
             }
             else
             {
-                GAPI_Assert(fx != 0. && fy != 0.);
-                return in.withSize
-                    (Size(static_cast<int>(std::round(in.size.width  * fx)),
-                          static_cast<int>(std::round(in.size.height * fy))));
+                int outSz_w = static_cast<int>(round(in.size.width  * fx));
+                int outSz_h = static_cast<int>(round(in.size.height * fy));
+                GAPI_Assert(outSz_w > 0 && outSz_h > 0);
+                return in.withSize(Size(outSz_w, outSz_h));
             }
+        }
+    };
+
+    G_TYPED_KERNEL(GResizeP, <GMatP(GMatP,Size,int)>, "org.opencv.core.transform.resizeP") {
+        static GMatDesc outMeta(GMatDesc in, Size sz, int interp) {
+            GAPI_Assert(in.depth == CV_8U);
+            GAPI_Assert(in.chan == 3);
+            GAPI_Assert(in.planar);
+            GAPI_Assert(interp == cv::INTER_LINEAR);
+            return in.withSize(sz);
         }
     };
 
@@ -424,9 +443,16 @@ namespace core {
         }
     };
 
+    // TODO: eliminate the need in this kernel (streaming)
     G_TYPED_KERNEL(GCrop, <GMat(GMat, Rect)>, "org.opencv.core.transform.crop") {
         static GMatDesc outMeta(GMatDesc in, Rect rc) {
             return in.withSize(Size(rc.width, rc.height));
+        }
+    };
+
+    G_TYPED_KERNEL(GCopy, <GMat(GMat)>, "org.opencv.core.transform.copy") {
+        static GMatDesc outMeta(GMatDesc in) {
+            return in;
         }
     };
 
@@ -459,7 +485,46 @@ namespace core {
             return in;
         }
     };
-}
+
+    G_TYPED_KERNEL(GNormalize, <GMat(GMat, double, double, int, int)>, "org.opencv.core.normalize") {
+        static GMatDesc outMeta(GMatDesc in, double, double, int, int ddepth) {
+            // unlike opencv doesn't have a mask as a parameter
+            return (ddepth < 0 ? in : in.withDepth(ddepth));
+        }
+    };
+
+    G_TYPED_KERNEL(GWarpPerspective, <GMat(GMat, const Mat&, Size, int, int, const cv::Scalar&)>, "org.opencv.core.warpPerspective") {
+        static GMatDesc outMeta(GMatDesc in, const Mat&, Size dsize, int, int borderMode, const cv::Scalar&) {
+            GAPI_Assert((borderMode == cv::BORDER_CONSTANT || borderMode == cv::BORDER_REPLICATE) &&
+                        "cv::gapi::warpPerspective supports only cv::BORDER_CONSTANT and cv::BORDER_REPLICATE border modes");
+            return in.withType(in.depth, in.chan).withSize(dsize);
+        }
+    };
+
+    G_TYPED_KERNEL(GWarpAffine, <GMat(GMat, const Mat&, Size, int, int, const cv::Scalar&)>, "org.opencv.core.warpAffine") {
+        static GMatDesc outMeta(GMatDesc in, const Mat&, Size dsize, int, int border_mode, const cv::Scalar&) {
+            GAPI_Assert(border_mode != cv::BORDER_TRANSPARENT &&
+                        "cv::BORDER_TRANSPARENT mode is not supported in cv::gapi::warpAffine");
+            return in.withType(in.depth, in.chan).withSize(dsize);
+        }
+    };
+} // namespace core
+
+namespace streaming {
+
+// Operations for Streaming (declared in this header for convenience)
+G_TYPED_KERNEL(GSize, <GOpaque<Size>(GMat)>, "org.opencv.streaming.size") {
+    static GOpaqueDesc outMeta(const GMatDesc&) {
+        return empty_gopaque_desc();
+    }
+};
+
+G_TYPED_KERNEL(GSizeR, <GOpaque<Size>(GOpaque<Rect>)>, "org.opencv.streaming.sizeR") {
+    static GOpaqueDesc outMeta(const GOpaqueDesc&) {
+        return empty_gopaque_desc();
+    }
+};
+} // namespace streaming
 
 //! @addtogroup gapi_math
 //! @{
@@ -486,7 +551,7 @@ Supported matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1, @ref 
 @param ddepth optional depth of the output matrix.
 @sa sub, addWeighted
 */
-GAPI_EXPORTS GMat add(const GMat& src1, const GMat& src2, int ddepth = -1);
+GAPI_EXPORTS_W GMat add(const GMat& src1, const GMat& src2, int ddepth = -1);
 
 /** @brief Calculates the per-element sum of matrix and given scalar.
 
@@ -682,7 +747,7 @@ GAPI_EXPORTS GMat divRC(const GScalar& divident, const GMat& src, double scale, 
 /** @brief Applies a mask to a matrix.
 
 The function mask set value from given matrix if the corresponding pixel value in mask matrix set to true,
-and set the matrix value to 0 overwise.
+and set the matrix value to 0 otherwise.
 
 Supported src matrix data types are @ref CV_8UC1, @ref CV_16SC1, @ref CV_16UC1. Supported mask data type is @ref CV_8UC1.
 
@@ -701,8 +766,9 @@ Supported matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1, @ref 
 
 @note Function textual ID is "org.opencv.core.math.mean"
 @param src input matrix.
+@sa  countNonZero, min, max
 */
-GAPI_EXPORTS GScalar mean(const GMat& src);
+GAPI_EXPORTS_W GScalar mean(const GMat& src);
 
 /** @brief Calculates x and y coordinates of 2D vectors from their magnitude and angle.
 
@@ -802,7 +868,7 @@ Supported input matrix data types are @ref CV_8UC1, @ref CV_16UC1, @ref CV_16SC1
 @note Function textual ID is "org.opencv.core.pixelwise.compare.cmpGT"
 @param src1 first input matrix.
 @param src2 second input matrix/scalar of the same depth as first input matrix.
-@sa min, max, threshold, cmpLE, cmpGE, cmpLS
+@sa min, max, threshold, cmpLE, cmpGE, cmpLT
 */
 GAPI_EXPORTS GMat cmpGT(const GMat& src1, const GMat& src2);
 /** @overload
@@ -854,7 +920,7 @@ Supported input matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1,
 @note Function textual ID is "org.opencv.core.pixelwise.compare.cmpGE"
 @param src1 first input matrix.
 @param src2 second input matrix/scalar of the same depth as first input matrix.
-@sa min, max, threshold, cmpLE, cmpGT, cmpLS
+@sa min, max, threshold, cmpLE, cmpGT, cmpLT
 */
 GAPI_EXPORTS GMat cmpGE(const GMat& src1, const GMat& src2);
 /** @overload
@@ -880,7 +946,7 @@ Supported input matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1,
 @note Function textual ID is "org.opencv.core.pixelwise.compare.cmpLE"
 @param src1 first input matrix.
 @param src2 second input matrix/scalar of the same depth as first input matrix.
-@sa min, max, threshold, cmpGT, cmpGE, cmpLS
+@sa min, max, threshold, cmpGT, cmpGE, cmpLT
 */
 GAPI_EXPORTS GMat cmpLE(const GMat& src1, const GMat& src2);
 /** @overload
@@ -958,7 +1024,7 @@ Supported matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1, @ref 
 */
 GAPI_EXPORTS GMat bitwise_and(const GMat& src1, const GMat& src2);
 /** @overload
-@note Function textual ID is "org.opencv.core.pixelwise.compare.bitwise_andS"
+@note Function textual ID is "org.opencv.core.pixelwise.bitwise_andS"
 @param src1 first input matrix.
 @param src2 scalar, which will be per-lemenetly conjuncted with elements of src1.
 */
@@ -982,7 +1048,7 @@ Supported matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1, @ref 
 */
 GAPI_EXPORTS GMat bitwise_or(const GMat& src1, const GMat& src2);
 /** @overload
-@note Function textual ID is "org.opencv.core.pixelwise.compare.bitwise_orS"
+@note Function textual ID is "org.opencv.core.pixelwise.bitwise_orS"
 @param src1 first input matrix.
 @param src2 scalar, which will be per-lemenetly disjuncted with elements of src1.
 */
@@ -1007,7 +1073,7 @@ Supported matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1, @ref 
 */
 GAPI_EXPORTS GMat bitwise_xor(const GMat& src1, const GMat& src2);
 /** @overload
-@note Function textual ID is "org.opencv.core.pixelwise.compare.bitwise_xorS"
+@note Function textual ID is "org.opencv.core.pixelwise.bitwise_xorS"
 @param src1 first input matrix.
 @param src2 scalar, for which per-lemenet "logical or" operation on elements of src1 will be performed.
 */
@@ -1067,7 +1133,7 @@ Supported input matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1,
 @note Function textual ID is "org.opencv.core.matrixop.min"
 @param src1 first input matrix.
 @param src2 second input matrix of the same size and depth as src1.
-@sa max, compareEqual, compareLess, compareLessEqual
+@sa max, cmpEQ, cmpLT, cmpLE
 */
 GAPI_EXPORTS GMat min(const GMat& src1, const GMat& src2);
 
@@ -1084,7 +1150,7 @@ Supported matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1, @ref 
 @note Function textual ID is "org.opencv.core.matrixop.max"
 @param src1 first input matrix.
 @param src2 second input matrix of the same size and depth as src1.
-@sa min, compare, compareEqual, compareGreater, compareGreaterEqual
+@sa min, compare, cmpEQ, cmpGT, cmpGE
 */
 GAPI_EXPORTS GMat max(const GMat& src1, const GMat& src2);
 
@@ -1130,9 +1196,22 @@ Supported matrix data types are @ref CV_8UC1, @ref CV_8UC3, @ref CV_16UC1, @ref 
 
 @note Function textual ID is "org.opencv.core.matrixop.sum"
 @param src input matrix.
-@sa min, max
+@sa countNonZero, mean, min, max
 */
 GAPI_EXPORTS GScalar sum(const GMat& src);
+
+/** @brief Counts non-zero array elements.
+
+The function returns the number of non-zero elements in src :
+\f[\sum _{I: \; \texttt{src} (I) \ne0 } 1\f]
+
+Supported matrix data types are @ref CV_8UC1, @ref CV_16UC1, @ref CV_16SC1, @ref CV_32FC1.
+
+@note Function textual ID is "org.opencv.core.matrixop.countNonZero"
+@param src input single-channel matrix.
+@sa  mean, min, max
+*/
+GAPI_EXPORTS GOpaque<int> countNonZero(const GMat& src);
 
 /** @brief Calculates the weighted sum of two matrices.
 
@@ -1248,10 +1327,10 @@ GAPI_EXPORTS std::tuple<GMat, GMat> integral(const GMat& src, int sdepth = -1, i
 /** @brief Applies a fixed-level threshold to each matrix element.
 
 The function applies fixed-level thresholding to a single- or multiple-channel matrix.
-The function is typically used to get a bi-level (binary) image out of a grayscale image ( cmp funtions could be also used for
+The function is typically used to get a bi-level (binary) image out of a grayscale image ( cmp functions could be also used for
 this purpose) or for removing a noise, that is, filtering out pixels with too small or too large
-values. There are several depths of thresholding supported by the function. They are determined by
-depth parameter.
+values. There are several types of thresholding supported by the function. They are determined by
+type parameter.
 
 Also, the special values cv::THRESH_OTSU or cv::THRESH_TRIANGLE may be combined with one of the
 above values. In these cases, the function determines the optimal threshold value using the Otsu's
@@ -1267,17 +1346,17 @@ Output matrix must be of the same size and depth as src.
 @param src input matrix (@ref CV_8UC1, @ref CV_8UC3, or @ref CV_32FC1).
 @param thresh threshold value.
 @param maxval maximum value to use with the cv::THRESH_BINARY and cv::THRESH_BINARY_INV thresholding
-depths.
-@param depth thresholding depth (see the cv::ThresholdTypes).
+types.
+@param type thresholding type (see the cv::ThresholdTypes).
 
-@sa min, max, cmpGT, cmpLE, cmpGE, cmpLS
+@sa min, max, cmpGT, cmpLE, cmpGE, cmpLT
  */
-GAPI_EXPORTS GMat threshold(const GMat& src, const GScalar& thresh, const GScalar& maxval, int depth);
+GAPI_EXPORTS GMat threshold(const GMat& src, const GScalar& thresh, const GScalar& maxval, int type);
 /** @overload
-This function appicable for all threshold depths except CV_THRESH_OTSU and CV_THRESH_TRIANGLE
+This function applicable for all threshold types except CV_THRESH_OTSU and CV_THRESH_TRIANGLE
 @note Function textual ID is "org.opencv.core.matrixop.thresholdOT"
 */
-GAPI_EXPORTS std::tuple<GMat, GScalar> threshold(const GMat& src, const GScalar& maxval, int depth);
+GAPI_EXPORTS_W std::tuple<GMat, GScalar> threshold(const GMat& src, const GScalar& maxval, int type);
 
 /** @brief Applies a range-level threshold to each matrix element.
 
@@ -1335,9 +1414,27 @@ enlarge an image, it will generally look best with cv::INTER_CUBIC (slow) or cv:
 \f[\texttt{(double)dsize.height/src.rows}\f]
 @param interpolation interpolation method, see cv::InterpolationFlags
 
-@sa  warpAffine, warpPerspective, remap
+@sa  warpAffine, warpPerspective, remap, resizeP
  */
 GAPI_EXPORTS GMat resize(const GMat& src, const Size& dsize, double fx = 0, double fy = 0, int interpolation = INTER_LINEAR);
+
+/** @brief Resizes a planar image.
+
+The function resizes the image src down to or up to the specified size.
+Planar image memory layout is three planes laying in the memory contiguously,
+so the image height should be plane_height*plane_number, image type is @ref CV_8UC1.
+
+Output image size will have the size dsize, the depth of output is the same as of src.
+
+@note Function textual ID is "org.opencv.core.transform.resizeP"
+
+@param src input image, must be of @ref CV_8UC1 type;
+@param dsize output image size;
+@param interpolation interpolation method, only cv::INTER_LINEAR is supported at the moment
+
+@sa  warpAffine, warpPerspective, remap, resize
+ */
+GAPI_EXPORTS GMatP resizeP(const GMatP& src, const Size& dsize, int interpolation = cv::INTER_LINEAR);
 
 /** @brief Creates one 3-channel (4-channel) matrix out of 3(4) single-channel ones.
 
@@ -1374,7 +1471,7 @@ All output matrices must be in @ref CV_8UC1.
 @sa merge3, merge4
 */
 GAPI_EXPORTS std::tuple<GMat, GMat, GMat,GMat> split4(const GMat& src);
-GAPI_EXPORTS std::tuple<GMat, GMat, GMat> split3(const GMat& src);
+GAPI_EXPORTS_W std::tuple<GMat, GMat, GMat> split3(const GMat& src);
 
 /** @brief Applies a generic geometrical transformation to an image.
 
@@ -1398,8 +1495,8 @@ Output image must be of the same size and depth as input one.
 CV_32FC1, or CV_32FC2.
 @param map2 The second map of y values having the type CV_16UC1, CV_32FC1, or none (empty map
 if map1 is (x,y) points), respectively.
-@param interpolation Interpolation method (see cv::InterpolationFlags). The method INTER_AREA is
-not supported by this function.
+@param interpolation Interpolation method (see cv::InterpolationFlags). The methods #INTER_AREA
+and #INTER_LINEAR_EXACT are not supported by this function.
 @param borderMode Pixel extrapolation method (see cv::BorderTypes). When
 borderMode=BORDER_TRANSPARENT, it means that the pixels in the destination image that
 corresponds to the "outliers" in the source image are not modified by the function.
@@ -1461,6 +1558,19 @@ Output matrix must be of the same depth as input one, size is specified by given
 @sa resize
 */
 GAPI_EXPORTS GMat crop(const GMat& src, const Rect& rect);
+
+/** @brief Copies a matrix.
+
+Copies an input array. Works as a regular Mat::clone but happens in-graph.
+Mainly is used to workaround some existing limitations (e.g. to forward an input frame to outputs
+in the streaming mode). Will be deprecated and removed in the future.
+
+@note Function textual ID is "org.opencv.core.transform.copy"
+
+@param src input matrix.
+@sa crop
+*/
+GAPI_EXPORTS GMat copy(const GMat& src);
 
 /** @brief Applies horizontal concatenation to given matrices.
 
@@ -1557,25 +1667,6 @@ number of channels as in the input matrix.
 */
 GAPI_EXPORTS GMat LUT(const GMat& src, const Mat& lut);
 
-/** @brief Performs a 3D look-up table transform of a multi-channel matrix.
-
-The function LUT3D fills the output matrix with values from the look-up table. Indices of the entries
-are taken from the input matrix. Interpolation is applied for mapping 0-255 range values to 0-16 range of 3DLUT table.
-The function processes each element of src as follows:
-@code{.cpp}
-    dst[i][j][k] = lut3D[~src_r][~src_g][~src_b];
-@endcode
-where ~ means approximation.
-Output is a matrix of of @ref CV_8UC3.
-
-@note Function textual ID is "org.opencv.core.transform.LUT3D"
-
-@param src input matrix of @ref CV_8UC3.
-@param lut3D look-up table 17x17x17 3-channel elements.
-@param interpolation The depth of interpoolation to be used.
-*/
-GAPI_EXPORTS GMat LUT3D(const GMat& src, const GMat& lut3D, int interpolation = INTER_NEAREST);
-
 /** @brief Converts a matrix to another data depth with optional scaling.
 
 The method converts source pixel values to the target data depth. saturate_cast\<\> is applied at
@@ -1592,8 +1683,100 @@ same as the input has; if rdepth is negative, the output matrix will have the sa
 @param beta optional delta added to the scaled values.
  */
 GAPI_EXPORTS GMat convertTo(const GMat& src, int rdepth, double alpha=1, double beta=0);
+
+/** @brief Normalizes the norm or value range of an array.
+
+The function normalizes scale and shift the input array elements so that
+\f[\| \texttt{dst} \| _{L_p}= \texttt{alpha}\f]
+(where p=Inf, 1 or 2) when normType=NORM_INF, NORM_L1, or NORM_L2, respectively; or so that
+\f[\min _I  \texttt{dst} (I)= \texttt{alpha} , \, \, \max _I  \texttt{dst} (I)= \texttt{beta}\f]
+when normType=NORM_MINMAX (for dense arrays only).
+
+@note Function textual ID is "org.opencv.core.normalize"
+
+@param src input array.
+@param alpha norm value to normalize to or the lower range boundary in case of the range
+normalization.
+@param beta upper range boundary in case of the range normalization; it is not used for the norm
+normalization.
+@param norm_type normalization type (see cv::NormTypes).
+@param ddepth when negative, the output array has the same type as src; otherwise, it has the same
+number of channels as src and the depth =ddepth.
+@sa norm, Mat::convertTo
+*/
+GAPI_EXPORTS GMat normalize(const GMat& src, double alpha, double beta,
+                            int norm_type, int ddepth = -1);
+
+/** @brief Applies a perspective transformation to an image.
+
+The function warpPerspective transforms the source image using the specified matrix:
+
+\f[\texttt{dst} (x,y) =  \texttt{src} \left ( \frac{M_{11} x + M_{12} y + M_{13}}{M_{31} x + M_{32} y + M_{33}} ,
+     \frac{M_{21} x + M_{22} y + M_{23}}{M_{31} x + M_{32} y + M_{33}} \right )\f]
+
+when the flag #WARP_INVERSE_MAP is set. Otherwise, the transformation is first inverted with invert
+and then put in the formula above instead of M. The function cannot operate in-place.
+
+@param src input image.
+@param M \f$3\times 3\f$ transformation matrix.
+@param dsize size of the output image.
+@param flags combination of interpolation methods (#INTER_LINEAR or #INTER_NEAREST) and the
+optional flag #WARP_INVERSE_MAP, that sets M as the inverse transformation (
+\f$\texttt{dst}\rightarrow\texttt{src}\f$ ).
+@param borderMode pixel extrapolation method (#BORDER_CONSTANT or #BORDER_REPLICATE).
+@param borderValue value used in case of a constant border; by default, it equals 0.
+
+@sa  warpAffine, resize, remap, getRectSubPix, perspectiveTransform
+ */
+GAPI_EXPORTS GMat warpPerspective(const GMat& src, const Mat& M, const Size& dsize, int flags = cv::INTER_LINEAR,
+                                  int borderMode = cv::BORDER_CONSTANT, const Scalar& borderValue = Scalar());
+
+/** @brief Applies an affine transformation to an image.
+
+The function warpAffine transforms the source image using the specified matrix:
+
+\f[\texttt{dst} (x,y) =  \texttt{src} ( \texttt{M} _{11} x +  \texttt{M} _{12} y +  \texttt{M} _{13}, \texttt{M} _{21} x +  \texttt{M} _{22} y +  \texttt{M} _{23})\f]
+
+when the flag #WARP_INVERSE_MAP is set. Otherwise, the transformation is first inverted
+with #invertAffineTransform and then put in the formula above instead of M. The function cannot
+operate in-place.
+
+@param src input image.
+@param M \f$2\times 3\f$ transformation matrix.
+@param dsize size of the output image.
+@param flags combination of interpolation methods (see #InterpolationFlags) and the optional
+flag #WARP_INVERSE_MAP that means that M is the inverse transformation (
+\f$\texttt{dst}\rightarrow\texttt{src}\f$ ).
+@param borderMode pixel extrapolation method (see #BorderTypes);
+borderMode=#BORDER_TRANSPARENT isn't supported
+@param borderValue value used in case of a constant border; by default, it is 0.
+
+@sa  warpPerspective, resize, remap, getRectSubPix, transform
+ */
+GAPI_EXPORTS GMat warpAffine(const GMat& src, const Mat& M, const Size& dsize, int flags = cv::INTER_LINEAR,
+                             int borderMode = cv::BORDER_CONSTANT, const Scalar& borderValue = Scalar());
 //! @} gapi_transform
 
+namespace streaming {
+/** @brief Gets dimensions from Mat.
+
+@note Function textual ID is "org.opencv.streaming.size"
+
+@param src Input tensor
+@return Size (tensor dimensions).
+*/
+GAPI_EXPORTS GOpaque<Size> size(const GMat& src);
+
+/** @overload
+Gets dimensions from rectangle.
+
+@note Function textual ID is "org.opencv.streaming.sizeR"
+
+@param r Input rectangle.
+@return Size (rectangle dimensions).
+*/
+GAPI_EXPORTS GOpaque<Size> size(const GOpaque<Rect>& r);
+} //namespace streaming
 } //namespace gapi
 } //namespace cv
 
